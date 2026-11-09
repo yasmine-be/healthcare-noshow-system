@@ -1,18 +1,21 @@
-from sqlalchemy import create_engine
-import pandas as pd
+from sqlalchemy import text
 
-import os
-from dotenv import load_dotenv
+from database import engine
 
-load_dotenv()
 
-DB_USER = os.getenv("DB_USER")
-DB_PASSWORD = os.getenv("DB_PASSWORD")
-DB_HOST = os.getenv("DB_HOST")
-DB_PORT = os.getenv("DB_PORT")
-DB_NAME = os.getenv("DB_NAME")
+def main():
+    with engine.connect() as connection:
+        total, first_date, last_date = connection.execute(
+            text(
+                "SELECT COUNT(*), MIN(date_rdv), MAX(date_rdv) "
+                "FROM appointments"
+            )
+        ).one()
+    print(
+        f"Appointments: {total}; date range: "
+        f"{first_date or 'n/a'} to {last_date or 'n/a'}"
+    )
 
-engine = create_engine(f"postgresql://{DB_USER}:{DB_PASSWORD}@{DB_HOST}:{DB_PORT}/{DB_NAME}")
 
-df = pd.read_sql("SELECT * FROM appointments", engine)
-print(df)
+if __name__ == "__main__":
+    main()

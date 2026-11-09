@@ -1,225 +1,297 @@
-import streamlit as st
-import requests
-import pandas as pd
-import plotly.express as px
+import os
 from datetime import date
 
-API_URL = "http://127.0.0.1:8000"
+import pandas as pd
+import plotly.express as px
+import requests
+import streamlit as st
+
+from feature_engineering import build_features
+from risk import HIGH_RISK_LOWER_BOUND
+
+API_URL = os.getenv("API_URL", "http://127.0.0.1:8000").rstrip("/")
+PAGE_SIZE = 500
+REQUEST_TIMEOUT = 10
 
 st.set_page_config(page_title="Suivi No-Show", page_icon="🏥", layout="wide")
+st.markdown(
+    """
+    <style>
+        .stApp { background-color: #F9FAFB; }
+        .hero-header {
+            background: linear-gradient(135deg, #1E3A5F 0%, #2563EB 100%);
+            padding: 2rem; border-radius: 20px; margin-bottom: 1.5rem;
+        }
+        .main-title { font-size: 2.5rem; font-weight: 800; color: white; }
+        .subtitle { color: #DBEAFE; font-size: 1.1rem; }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
+st.markdown(
+    """
+    <div class="hero-header">
+        <p class="main-title">Suivi des rendez-vous</p>
+        <p class="subtitle">Tableau de bord du risque de no-show</p>
+    </div>
+    """,
+    unsafe_allow_html=True,
+)
 
-# CSS 
-st.markdown("""
-<style>
-    /* Fond général */
-    .stApp {
-        background-color: #F9FAFB;
-    }
+if "token" not in st.session_state:
+    st.session_state.token = None
+if "expired" not in st.session_state:
+    st.session_state.expired = False
 
-    /* Header avec dégradé */
-    .hero-header {
-        background: linear-gradient(135deg, #1E3A5F 0%, #2563EB 100%);
-        padding: 2.5rem 2rem;
-        border-radius: 20px;
-        margin-bottom: 2rem;
-        box-shadow: 0 10px 30px rgba(37, 99, 235, 0.15);
-    }
-    .main-title {
-        font-size: 3rem;
-        font-weight: 800;
-        color: white;
-        margin-bottom: 0.3rem;
-        letter-spacing: -1px;
-    }
-    .subtitle {
-        color: #DBEAFE;
-        font-size: 1.1rem;
-        margin-top: 0;
-        font-weight: 400;
-    }
 
-    /* Cartes de métriques */
-    div[data-testid="stMetric"] {
-        background: white;
-        border: none;
-        border-radius: 16px;
-        padding: 20px;
-        box-shadow: 0 2px 12px rgba(0, 0, 0, 0.06);
-        transition: transform 0.2s ease;
-    }
-    div[data-testid="stMetric"]:hover {
-        transform: translateY(-3px);
-        box-shadow: 0 6px 20px rgba(0, 0, 0, 0.1);
-    }
-    div[data-testid="stMetricLabel"] {
-        font-size: 0.95rem;
-        font-weight: 600;
-        color: #6B7280;
-    }
-    div[data-testid="stMetricValue"] {
-        font-size: 2.2rem;
-        font-weight: 800;
-        color: #1E3A5F;
-    }
+def api_request(method, path, *, authenticated=True, **kwargs):
+    headers = kwargs.pop("headers", {})
+    timeout = kwargs.pop("timeout", REQUEST_TIMEOUT)
+    if authenticated:
+        headers["Authorization"] = f"Bearer {st.session_state.token}"
+    try:
+        response = requests.request(
+            method,
+            f"{API_URL}{path}",
+            headers=headers,
+            timeout=timeout,
+            **kwargs,
+        )
+    except requests.RequestException as exc:
+        st.error(f"Impossible de joindre l'API ({exc}). Vérifiez qu'elle est démarrée.")
+        st.stop()
+    if response.status_code == 401 and authenticated:
+        st.session_state.token = None
+        st.session_state.expired = True
+        st.rerun()
+    try:
+        response.raise_for_status()
+    except requests.HTTPError:
+        st.error(f"L'API a répondu avec le statut {response.status_code}.")
+        st.stop()
+    return response.json()
 
-    /* Badges de risque */
-    .risk-high {
-        background: linear-gradient(135deg, #FEE2E2, #FECACA);
-        color: #991B1B;
-        padding: 6px 14px;
-        border-radius: 10px;
-        font-weight: 700;
-        font-size: 0.85rem;
-    }
-    .risk-medium {
-        background: linear-gradient(135deg, #FEF3C7, #FDE68A);
-        color: #92400E;
-        padding: 6px 14px;
-        border-radius: 10px;
-        font-weight: 700;
-        font-size: 0.85rem;
-    }
-    .risk-low {
-        background: linear-gradient(135deg, #D1FAE5, #A7F3D0);
-        color: #065F46;
-        padding: 6px 14px;
-        border-radius: 10px;
-        font-weight: 700;
-        font-size: 0.85rem;
-    }
 
-    /* Tabs plus stylées */
-    .stTabs [data-baseweb="tab-list"] {
-        gap: 8px;
-    }
-    .stTabs [data-baseweb="tab"] {
-        background-color: white;
-        border-radius: 10px;
-        padding: 10px 20px;
-        font-weight: 600;
-    }
-    .stTabs [aria-selected="true"] {
-        background-color: #2563EB;
-        color: white;
-    }
+def fetch_all(path):
+    records = []
+    offset = 0
+    while True:
+        page = api_request(
+            "GET",
+            path,
+            params={"limit": PAGE_SIZE, "offset": offset},
+        )
+        records.extend(page)
+        if len(page) < PAGE_SIZE:
+            return records
+        offset += PAGE_SIZE
 
-    /* Sidebar : texte blanc SAUF à l'intérieur des champs de saisie */
-    section[data-testid="stSidebar"] {
-        background-color: #1E3A5F;
-    }
-    section[data-testid="stSidebar"] label,
-    section[data-testid="stSidebar"] h1,
-    section[data-testid="stSidebar"] h2,
-    section[data-testid="stSidebar"] h3,
-    section[data-testid="stSidebar"] p {
-        color: white !important;
-    }
-    section[data-testid="stSidebar"] input {
-        color: #1E3A5F !important;
-    }
-</style>
-""", unsafe_allow_html=True)
 
-st.markdown("""
-<div class="hero-header">
-    <p class="main-title">🏥 Suivi des Rendez-vous</p>
-    <p class="subtitle">Prédiction du risque de no-show par intelligence artificielle</p>
-</div>
-""", unsafe_allow_html=True)
+if st.session_state.token is None:
+    st.subheader("Connexion")
+    if st.session_state.expired:
+        st.warning("Votre session a expiré. Veuillez vous reconnecter.")
+    with st.form("login_form"):
+        username = st.text_input("Nom d'utilisateur")
+        password = st.text_input("Mot de passe", type="password")
+        submitted = st.form_submit_button("Se connecter")
+    if submitted:
+        try:
+            response = requests.post(
+                f"{API_URL}/auth/login",
+                data={"username": username, "password": password},
+                timeout=REQUEST_TIMEOUT,
+            )
+        except requests.RequestException as exc:
+            st.error(f"Impossible de joindre l'API ({exc}).")
+        else:
+            if response.status_code == 200:
+                st.session_state.token = response.json()["access_token"]
+                st.session_state.expired = False
+                st.rerun()
+            elif response.status_code == 401:
+                st.error("Identifiants incorrects.")
+            else:
+                st.error(f"Échec de connexion à l'API (statut {response.status_code}).")
+    st.stop()
 
-#  Données 
-appointments = requests.get(f"{API_URL}/appointments").json()
-patients = requests.get(f"{API_URL}/patients").json()
-
-df = pd.DataFrame(appointments)
-df_patients = pd.DataFrame(patients)
-df = df.merge(df_patients[['id', 'name']], left_on='patient_id', right_on='id', suffixes=('', '_patient'))
-df = df.rename(columns={'name': 'patient_name'})
-df['date_reservation'] = pd.to_datetime(df['date_reservation'])
-df['date_rdv'] = pd.to_datetime(df['date_rdv'])
-
-# Sidebar 
 with st.sidebar:
-    st.header("⚙️ Filtres")
-    selected_date = st.date_input("Date à analyser", value=date(2026, 7, 15))
+    st.header("Filtres")
+    if st.button("Se déconnecter"):
+        st.session_state.token = None
+        st.rerun()
 
-day_appointments = df[df['date_rdv'].dt.date == selected_date].copy()
+appointments = fetch_all("/appointments")
+patients = fetch_all("/patients")
+df = pd.DataFrame(
+    appointments,
+    columns=[
+        "id",
+        "patient_id",
+        "doctor_id",
+        "date_reservation",
+        "date_rdv",
+        "motif_visite",
+        "statut",
+    ],
+)
+df_patients = pd.DataFrame(patients, columns=["id", "name"])
+if not df.empty:
+    df["date_reservation"] = pd.to_datetime(df["date_reservation"])
+    df["date_rdv"] = pd.to_datetime(df["date_rdv"])
+    features = build_features(df)
+    df = df.merge(
+        df_patients[["id", "name"]],
+        left_on="patient_id",
+        right_on="id",
+        how="left",
+        suffixes=("", "_patient"),
+    ).rename(columns={"name": "patient_name"})
+    df["patient_name"] = df["patient_name"].fillna("Patient inconnu")
+    default_date = df["date_rdv"].max().date()
+else:
+    features = pd.DataFrame(columns=["id", "date_rdv", "patient_id", "delai_jours",
+                                     "jour_semaine", "nb_no_show_precedents"])
+    default_date = date.today()
+
+selected_date = st.sidebar.date_input("Date à analyser", value=default_date)
+day_appointments = (
+    df[df["date_rdv"].dt.date == selected_date].copy() if not df.empty else df.copy()
+)
 
 if day_appointments.empty:
     st.info(f"Aucun rendez-vous le {selected_date}.")
 else:
-    risk_scores, risk_levels = [], []
-    for _, row in day_appointments.iterrows():
-        delai = (row['date_rdv'] - row['date_reservation']).days
-        jour = row['date_rdv'].dayofweek
-        historique = df[
-            (df['patient_id'] == row['patient_id']) &
-            (df['date_rdv'] < row['date_rdv']) &
-            (df['statut'] == 'no_show')
-        ].shape[0]
+    day_features = features[features["date_rdv"].dt.date == selected_date]
+    batch = [
+        {
+            "delai_jours": int(row.delai_jours),
+            "jour_semaine": int(row.jour_semaine),
+            "nb_no_show_precedents": int(row.nb_no_show_precedents),
+        }
+        for row in day_features.itertuples()
+    ]
+    predictions = []
+    for start in range(0, len(batch), PAGE_SIZE):
+        predictions.extend(
+            api_request(
+                "POST",
+                "/predict/batch",
+                json={"items": batch[start : start + PAGE_SIZE]},
+            )
+        )
+    prediction_frame = pd.DataFrame(predictions)
+    day_appointments = day_appointments.merge(
+        features[
+            [
+                "id",
+                "delai_jours",
+                "jour_semaine",
+                "nb_no_show_precedents",
+            ]
+        ].assign(_feature_order=range(len(features))),
+        on="id",
+        how="left",
+    ).sort_values("_feature_order")
+    day_appointments["risk_score"] = prediction_frame["risk_score"].to_numpy()
+    day_appointments["risk_level"] = prediction_frame["risk_level"].to_numpy()
+    day_appointments = day_appointments.sort_values("risk_score", ascending=False)
 
-        response = requests.post(f"{API_URL}/predict", json={
-            "delai_jours": delai, "jour_semaine": jour, "nb_no_show_precedents": historique
-        })
-        result = response.json()
-        risk_scores.append(result['risk_score'])
-        risk_levels.append(result['risk_level'])
-
-    day_appointments['risk_score'] = risk_scores
-    day_appointments['risk_level'] = risk_levels
-    day_appointments = day_appointments.sort_values('risk_score', ascending=False)
-
-    # KPIs 
     col1, col2, col3 = st.columns(3)
-    col1.metric("📅 Rendez-vous du jour", len(day_appointments))
-    col2.metric("⚠️ Absences probables", (day_appointments['risk_score'] > 0.5).sum())
-    col3.metric("📊 Risque moyen", f"{day_appointments['risk_score'].mean():.0%}")
+    col1.metric("Rendez-vous du jour", len(day_appointments))
+    col2.metric(
+        "Risque élevé",
+        (day_appointments["risk_score"] >= HIGH_RISK_LOWER_BOUND).sum(),
+    )
+    col3.metric("Risque moyen", f"{day_appointments['risk_score'].mean():.0%}")
+    st.subheader(f"Rendez-vous du {selected_date}")
+    st.dataframe(
+        day_appointments[
+            ["patient_id", "patient_name", "motif_visite", "risk_score", "risk_level"]
+        ],
+        use_container_width=True,
+        hide_index=True,
+    )
+    st.subheader("Assistant GenAI local")
+    st.caption(
+        "Les suggestions sont générées localement à partir des indicateurs de risque. "
+        "Elles ne remplacent pas le jugement du personnel et doivent être validées."
+    )
+    selected_index = st.selectbox(
+        "Rendez-vous à examiner",
+        options=list(range(len(day_appointments))),
+        format_func=lambda index: (
+            f"Patient #{day_appointments.iloc[index]['patient_id']} — "
+            f"{day_appointments.iloc[index]['risk_score']:.0%} de risque"
+        ),
+    )
+    if st.button("Générer une suggestion IA"):
+        selected = day_appointments.iloc[selected_index]
+        advice = api_request(
+            "POST",
+            "/assistant/no-show",
+            timeout=90,
+            json={
+                "risk_score": float(selected["risk_score"]),
+                "risk_level": selected["risk_level"],
+                "delai_jours": int(selected["delai_jours"]),
+                "jour_semaine": int(selected["jour_semaine"]),
+                "nb_no_show_precedents": int(
+                    selected["nb_no_show_precedents"]
+                ),
+            },
+        )
+        st.info(advice["summary"])
+        st.markdown("\n".join(f"- {action}" for action in advice["actions"]))
+        st.caption(advice["disclaimer"])
 
-    st.divider()
-
-    # Tabs 
-    tab1, tab2, tab3 = st.tabs(["📋 Rendez-vous du jour", "📊 Statistiques globales", "🔍 Recherche patient"])
-
-    with tab1:
-        def risk_badge(level):
-            css_class = {"high": "risk-high", "medium": "risk-medium", "low": "risk-low"}[level]
-            label = {"high": "Élevé", "medium": "Moyen", "low": "Faible"}[level]
-            return f'<span class="{css_class}">{label}</span>'
-
-        st.subheader(f"Rendez-vous du {selected_date}")
-        for _, row in day_appointments.iterrows():
-            c1, c2, c3, c4 = st.columns([3, 3, 2, 2])
-            c1.write(f"**#{row['patient_id']}** — {row['patient_name']}")
-            c2.write(row['motif_visite'])
-            c3.write(f"{row['risk_score']:.0%}")
-            c4.markdown(risk_badge(row['risk_level']), unsafe_allow_html=True)
-
-    with tab2:
+if not df.empty:
+    tab_stats, tab_patient = st.tabs(["Statistiques globales", "Recherche patient"])
+    with tab_stats:
+        monthly_stats = (
+            df.assign(mois=df["date_rdv"].dt.to_period("M").astype(str))
+            .groupby("mois")["statut"]
+            .apply(lambda status: status.eq("no_show").mean() * 100)
+            .rename("Taux de no-show (%)")
+            .reset_index()
+        )
         st.subheader("Taux de no-show par mois")
-        df['mois'] = df['date_rdv'].dt.to_period('M').astype(str)
-        monthly_stats = df.groupby('mois')['statut'].apply(lambda x: (x == 'no_show').mean() * 100).reset_index()
-        monthly_stats.columns = ['Mois', 'Taux de no-show (%)']
-        fig = px.bar(monthly_stats, x='Mois', y='Taux de no-show (%)', color='Taux de no-show (%)',
-                     color_continuous_scale=['#10B981', '#F59E0B', '#EF4444'])
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(
+            px.bar(monthly_stats, x="mois", y="Taux de no-show (%)"),
+            use_container_width=True,
+        )
+        motif_stats = (
+            df.groupby("motif_visite")["statut"]
+            .apply(lambda status: status.eq("no_show").mean() * 100)
+            .rename("Taux de no-show (%)")
+            .reset_index()
+        )
+        st.subheader("Taux de no-show par motif")
+        st.plotly_chart(
+            px.bar(motif_stats, x="motif_visite", y="Taux de no-show (%)"),
+            use_container_width=True,
+        )
 
-        st.subheader("Taux de no-show par motif de visite")
-        motif_stats = df.groupby('motif_visite')['statut'].apply(lambda x: (x == 'no_show').mean() * 100).reset_index()
-        motif_stats.columns = ['Motif', 'Taux de no-show (%)']
-        fig2 = px.bar(motif_stats, x='Motif', y='Taux de no-show (%)', color='Taux de no-show (%)',
-                      color_continuous_scale=['#10B981', '#F59E0B', '#EF4444'])
-        st.plotly_chart(fig2, use_container_width=True)
-
-    with tab3:
-        st.subheader("Rechercher l'historique d'un patient")
-        patient_names = df_patients['name'].tolist()
-        selected_patient = st.selectbox("Choisir un patient", patient_names)
-
-        patient_id = df_patients[df_patients['name'] == selected_patient]['id'].values[0]
-        patient_history = df[df['patient_id'] == patient_id].sort_values('date_rdv')
-
-        nb_no_show = (patient_history['statut'] == 'no_show').sum()
-        nb_total = len(patient_history)
-        st.metric("Historique de no-show", f"{nb_no_show} / {nb_total} rendez-vous")
-
-        st.dataframe(patient_history[['date_rdv', 'motif_visite', 'statut']])
+    with tab_patient:
+        patient_options = sorted(
+            ((int(row.id), str(row.name)) for row in df_patients.itertuples()),
+            key=lambda item: (item[1].casefold(), item[0]),
+        )
+        if not patient_options:
+            st.info("Aucun patient enregistré.")
+        else:
+            selected_id = st.selectbox(
+                "Choisir un patient",
+                options=[option[0] for option in patient_options],
+                format_func=lambda patient_id: next(
+                    name for current_id, name in patient_options if current_id == patient_id
+                ),
+            )
+            patient_history = df[df["patient_id"] == selected_id].sort_values("date_rdv")
+            no_shows = patient_history["statut"].eq("no_show").sum()
+            st.metric("Historique de no-show", f"{no_shows} / {len(patient_history)}")
+            st.dataframe(
+                patient_history[["date_rdv", "motif_visite", "statut"]],
+                use_container_width=True,
+                hide_index=True,
+            )

@@ -1,55 +1,78 @@
+import argparse
 import random
-from datetime import datetime, timedelta
-from sqlalchemy import create_engine, text
+from datetime import date, timedelta
+
+from sqlalchemy import text
+
+from database import engine
+
+MOTIFS = [
+    "Consultation générale",
+    "Suivi",
+    "Vaccination",
+    "Contrôle annuel",
+    "Urgence mineure",
+]
 
 
-import os
-from dotenv import load_dotenv
-
-load_dotenv()
-
-DB_USER = os.getenv("DB_USER")
-DB_PASSWORD = os.getenv("DB_PASSWORD")
-DB_HOST = os.getenv("DB_HOST")
-DB_PORT = os.getenv("DB_PORT")
-DB_NAME = os.getenv("DB_NAME")
-
-engine = create_engine(f"postgresql://{DB_USER}:{DB_PASSWORD}@{DB_HOST}:{DB_PORT}/{DB_NAME}")
-
-with engine.connect() as conn:
-    conn.execute(text("TRUNCATE TABLE appointments RESTART IDENTITY;"))
-    conn.commit()
-
-motifs = ['Consultation générale', 'Suivi', 'Vaccination', 'Contrôle annuel', 'Urgence mineure']
-nb_patients = 15
-nb_doctors = 8
-nb_appointments = 250
-
-rows = []
-for i in range(nb_appointments):
-    patient_id = random.randint(1, nb_patients)
-    doctor_id = random.randint(1, nb_doctors)
-    date_reservation = datetime(2026, 6, 1) + timedelta(days=random.randint(0, 60))
-
-    delai = random.randint(1, 45)
-    date_rdv = date_reservation + timedelta(days=delai, hours=random.randint(8, 17))
-
-    proba_base = 0.05
-    proba_no_show = min(proba_base + delai * 0.015, 0.7)
-    is_no_show = random.random() < proba_no_show
-    statut = 'no_show' if is_no_show else 'confirmé'
-
-    rows.append((patient_id, doctor_id, date_reservation.date(), date_rdv, random.choice(motifs), statut))
-
-
-# Insertion en base
-with engine.connect() as conn:
-    for row in rows:
-        conn.execute(
-            text("""INSERT INTO appointments (patient_id, doctor_id, date_reservation, date_rdv, motif_visite, statut)
-                     VALUES (:p, :d, :dr, :dt, :m, :s)"""),
-            {"p": row[0], "d": row[1], "dr": row[2], "dt": row[3], "m": row[4], "s": row[5]}
+def generate_appointments(patient_ids, doctor_ids, count=250, seed=42):
+    if not patient_ids or not doctor_ids:
+        raise ValueError("Create at least one patient and one doctor before generating data")
+    rng = random.Random(seed)
+    rows = []
+    for _ in range(count):
+        reservation_date = date(2026, 6, 1) + timedelta(days=rng.randint(0, 60))
+        delay = rng.randint(1, 45)
+        appointment_date = reservation_date + timedelta(days=delay)
+        probability = min(0.05 + delay * 0.015, 0.7)
+        status = "no_show" if rng.random() < probability else "confirmé"
+        rows.append(
+            {
+                "patient_id": rng.choice(patient_ids),
+                "doctor_id": rng.choice(doctor_ids),
+                "date_reservation": reservation_date,
+                "date_rdv": appointment_date,
+                "motif_visite": rng.choice(MOTIFS),
+                "statut": status,
+            }
         )
-    conn.commit()
+    return rows
 
-print(f"{nb_appointments} rendez-vous générés avec succès.")
+
+def main():
+    parser = argparse.ArgumentParser(description="Generate clearly synthetic appointment data.")
+    parser.add_argument("--count", type=int, default=250)
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument(
+        "--replace",
+        action="store_true",
+        help="Delete all existing appointments before inserting synthetic data.",
+    )
+    args = parser.parse_args()
+    if args.count < 1:
+        parser.error("--count must be positive")
+
+    with engine.begin() as connection:
+        patient_ids = connection.execute(
+            text("SELECT id FROM patients ORDER BY id")
+        ).scalars().all()
+        doctor_ids = connection.execute(
+            text("SELECT id FROM doctors ORDER BY id")
+        ).scalars().all()
+        rows = generate_appointments(patient_ids, doctor_ids, args.count, args.seed)
+        if args.replace:
+            connection.execute(text("TRUNCATE TABLE appointments RESTART IDENTITY"))
+        connection.execute(
+            text(
+                "INSERT INTO appointments "
+                "(patient_id, doctor_id, date_reservation, date_rdv, motif_visite, statut) "
+                "VALUES (:patient_id, :doctor_id, :date_reservation, :date_rdv, "
+                ":motif_visite, :statut)"
+            ),
+            rows,
+        )
+    print(f"Generated {len(rows)} synthetic appointments (seed={args.seed}).")
+
+
+if __name__ == "__main__":
+    main()

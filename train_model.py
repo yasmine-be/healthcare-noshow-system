@@ -1,63 +1,98 @@
-from sqlalchemy import create_engine
-import pandas as pd
-from sklearn.model_selection import train_test_split
-from sklearn.metrics import accuracy_score, classification_report
-import xgboost as xgb
-
-import os
-from dotenv import load_dotenv
-
-load_dotenv()
-
-DB_USER = os.getenv("DB_USER")
-DB_PASSWORD = os.getenv("DB_PASSWORD")
-DB_HOST = os.getenv("DB_HOST")
-DB_PORT = os.getenv("DB_PORT")
-DB_NAME = os.getenv("DB_NAME")
-
-engine = create_engine(f"postgresql://{DB_USER}:{DB_PASSWORD}@{DB_HOST}:{DB_PORT}/{DB_NAME}")
-df = pd.read_sql("SELECT * FROM appointments", engine)
-
-# Convertir les colonnes en datetime
-df['date_reservation'] = pd.to_datetime(df['date_reservation'])
-df['date_rdv'] = pd.to_datetime(df['date_rdv'])
-
-# Feature 1 : délai en jours entre la réservation et le RDV
-
-df['delai_jours'] = (df['date_rdv']-df["date_reservation"]).dt.days
-
-# Feature 2 : jour de la semaine du RDV (0=lundi, 6=dimanche)
-
-df['jour_semaine'] = df["date_rdv"].dt.dayofweek
-
-# Feature 3 : la cible (target) que le modèle doit prédire
-df['no_show'] = (df['statut'] == 'no_show').astype(int)
-
-print(df[['patient_id', 'delai_jours', 'jour_semaine', 'no_show']])
-
-df['no_show_cumsum'] = (df.groupby('patient_id')['no_show'].cumsum()).astype(int)
-df['nb_no_show_precedents'] = (df.groupby('patient_id')['no_show_cumsum'].shift(1).fillna(0)).astype(int)
-print(df['no_show_cumsum'])
-print(df[['patient_id', 'date_rdv', 'nb_no_show_precedents']])
-
-
-print(df[df['patient_id'] == 1][['patient_id', 'date_rdv', 'no_show', 'no_show_cumsum', 'nb_no_show_precedents']])
-print(df[df['patient_id'] == 9][['patient_id', 'date_rdv', 'no_show', 'no_show_cumsum', 'nb_no_show_precedents']])
-
-
-X = df[['delai_jours','jour_semaine' ,'nb_no_show_precedents']]
-y = df['no_show']
-
-X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
-
-# Entraînement du modèle
-model = xgb.XGBClassifier()
-model.fit(X_train, y_train)
-
-# Évaluation
-y_pred = model.predict(X_test)
-print("Accuracy:", accuracy_score(y_test, y_pred))
-print(classification_report(y_test, y_pred))
-
 import joblib
-joblib.dump(model, 'model.pkl')
+import pandas as pd
+import xgboost as xgb
+from sklearn.metrics import (
+    accuracy_score,
+    average_precision_score,
+    brier_score_loss,
+    classification_report,
+    f1_score,
+    precision_score,
+    recall_score,
+    roc_auc_score,
+)
+from sqlalchemy import text
+
+from database import engine
+from feature_engineering import (
+    FEATURE_COLUMNS,
+    OBSERVED_ATTENDANCE_STATUSES,
+    build_features,
+)
+
+MODEL_PATH = "model.pkl"
+
+
+def train_model(appointments: pd.DataFrame):
+    observed = appointments[
+        appointments["statut"].isin(OBSERVED_ATTENDANCE_STATUSES)
+    ].copy()
+    if observed.empty:
+        raise ValueError("No completed or no-show appointments are available for training")
+    features = build_features(observed)
+    if len(features) < 2:
+        raise ValueError("At least two appointments are required to train a model")
+
+    dates = features["date_rdv"].drop_duplicates().sort_values().tolist()
+    if len(dates) < 2:
+        raise ValueError("At least two appointment dates are required for time-based evaluation")
+
+    split_date = dates[max(1, min(len(dates) - 1, int(len(dates) * 0.8)))]
+    train = features[features["date_rdv"] < split_date]
+    test = features[features["date_rdv"] >= split_date]
+    if train.empty or test.empty or train["no_show"].nunique() < 2:
+        raise ValueError(
+            "The chronological training partition must contain both no-show classes"
+        )
+
+    model = xgb.XGBClassifier(
+        eval_metric="logloss",
+        n_estimators=200,
+        random_state=42,
+        n_jobs=1,
+    )
+    model.fit(train[FEATURE_COLUMNS], train["no_show"])
+
+    predictions = model.predict(test[FEATURE_COLUMNS])
+    probabilities = model.predict_proba(test[FEATURE_COLUMNS])[
+        :, list(model.classes_).index(1)
+    ]
+    metrics = {
+        "split_date": str(split_date),
+        "train_rows": len(train),
+        "test_rows": len(test),
+        "accuracy": float(accuracy_score(test["no_show"], predictions)),
+        "precision": float(precision_score(test["no_show"], predictions, zero_division=0)),
+        "recall": float(recall_score(test["no_show"], predictions, zero_division=0)),
+        "f1": float(f1_score(test["no_show"], predictions, zero_division=0)),
+        "roc_auc": (
+            float(roc_auc_score(test["no_show"], probabilities))
+            if test["no_show"].nunique() == 2
+            else None
+        ),
+        "pr_auc": float(average_precision_score(test["no_show"], probabilities)),
+        "brier_score": float(brier_score_loss(test["no_show"], probabilities)),
+    }
+    return model, metrics, classification_report(
+        test["no_show"], predictions, zero_division=0
+    )
+
+
+def main():
+    with engine.connect() as connection:
+        appointments = pd.read_sql(
+            text(
+                "SELECT id, patient_id, date_reservation, date_rdv, statut "
+                "FROM appointments ORDER BY date_rdv, id"
+            ),
+            connection,
+        )
+    model, metrics, report = train_model(appointments)
+    joblib.dump(model, MODEL_PATH)
+    print("Evaluation metrics:", metrics)
+    print(report)
+    print(f"Saved trained model to {MODEL_PATH}")
+
+
+if __name__ == "__main__":
+    main()

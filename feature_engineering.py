@@ -1,42 +1,68 @@
-from sqlalchemy import create_engine
 import pandas as pd
 
-import os
-from dotenv import load_dotenv
-
-load_dotenv()
-
-DB_USER = os.getenv("DB_USER")
-DB_PASSWORD = os.getenv("DB_PASSWORD")
-DB_HOST = os.getenv("DB_HOST")
-DB_PORT = os.getenv("DB_PORT")
-DB_NAME = os.getenv("DB_NAME")
-
-engine = create_engine(f"postgresql://{DB_USER}:{DB_PASSWORD}@{DB_HOST}:{DB_PORT}/{DB_NAME}")
-df = pd.read_sql("SELECT * FROM appointments", engine)
-
-# Convertir les colonnes en datetime
-df['date_reservation'] = pd.to_datetime(df['date_reservation'])
-df['date_rdv'] = pd.to_datetime(df['date_rdv'])
-
-# Feature 1 : délai en jours entre la réservation et le RDV
-
-df['delai_jours'] = (df['date_rdv']-df["date_reservation"]).dt.days
-
-# Feature 2 : jour de la semaine du RDV (0=lundi, 6=dimanche)
-
-df['jour_semaine'] = df["date_rdv"].dt.dayofweek
-
-# Feature 3 : la cible (target) que le modèle doit prédire
-df['no_show'] = (df['statut'] == 'no_show').astype(int)
-
-print(df[['patient_id', 'delai_jours', 'jour_semaine', 'no_show']])
-
-df['no_show_cumsum'] = (df.groupby('patient_id')['no_show'].cumsum()).astype(int)
-df['nb_no_show_precedents'] = (df.groupby('patient_id')['no_show_cumsum'].shift(1).fillna(0)).astype(int)
-print(df['no_show_cumsum'])
-print(df[['patient_id', 'date_rdv', 'nb_no_show_precedents']])
+FEATURE_COLUMNS = [
+    "delai_jours",
+    "jour_semaine",
+    "nb_no_show_precedents",
+]
+OBSERVED_ATTENDANCE_STATUSES = {
+    "no_show",
+    "confirmé",
+    "confirmed",
+    "présent",
+    "attended",
+    "completed",
+}
 
 
-print(df[df['patient_id'] == 1][['patient_id', 'date_rdv', 'no_show', 'no_show_cumsum', 'nb_no_show_precedents']])
-print(df[df['patient_id'] == 9][['patient_id', 'date_rdv', 'no_show', 'no_show_cumsum', 'nb_no_show_precedents']])
+def build_features(appointments: pd.DataFrame) -> pd.DataFrame:
+    required = {"patient_id", "date_reservation", "date_rdv", "statut"}
+    missing = required.difference(appointments.columns)
+    if missing:
+        raise ValueError(f"Missing appointment columns: {', '.join(sorted(missing))}")
+
+    frame = appointments.copy()
+    if frame[list(required)].isna().any().any():
+        raise ValueError("Appointment feature inputs cannot contain missing values")
+    frame["date_reservation"] = pd.to_datetime(frame["date_reservation"])
+    frame["date_rdv"] = pd.to_datetime(frame["date_rdv"])
+    if "id" not in frame:
+        frame["id"] = range(len(frame))
+    elif frame["id"].duplicated().any():
+        raise ValueError("Appointment IDs must be unique")
+
+    frame = frame.sort_values(
+        ["patient_id", "date_rdv", "id"], kind="stable"
+    ).reset_index(drop=True)
+    frame["delai_jours"] = (
+        frame["date_rdv"].dt.normalize() - frame["date_reservation"].dt.normalize()
+    ).dt.days
+    if (frame["delai_jours"] < 0).any():
+        raise ValueError("Appointment date cannot be before reservation date")
+    frame["jour_semaine"] = frame["date_rdv"].dt.dayofweek
+    frame["no_show"] = frame["statut"].eq("no_show").astype("int8")
+
+    daily = (
+        frame.groupby(["patient_id", frame["date_rdv"].dt.date], sort=False)["no_show"]
+        .sum()
+        .rename("daily_no_shows")
+        .reset_index()
+        .rename(columns={"date_rdv": "appointment_date"})
+    )
+    daily["nb_no_show_precedents"] = daily.groupby(
+        "patient_id", sort=False
+    )["daily_no_shows"].transform(lambda counts: counts.cumsum().shift(1, fill_value=0))
+    frame["appointment_date"] = frame["date_rdv"].dt.date
+    frame = frame.merge(
+        daily[["patient_id", "appointment_date", "nb_no_show_precedents"]],
+        on=["patient_id", "appointment_date"],
+        how="left",
+        validate="many_to_one",
+    )
+    frame["nb_no_show_precedents"] = frame["nb_no_show_precedents"].astype("int64")
+    return frame
+
+
+def build_inference_features(appointments: pd.DataFrame) -> pd.DataFrame:
+    features = build_features(appointments)
+    return features[FEATURE_COLUMNS]
