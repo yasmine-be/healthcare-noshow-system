@@ -55,6 +55,11 @@ Set `API_URL` in the environment if the dashboard should use a different API URL
 Review [SECURITY_PRIVACY.md](./SECURITY_PRIVACY.md) before using personal data
 and [IMPROVEMENT_ROADMAP.md](./IMPROVEMENT_ROADMAP.md) for prioritized next steps.
 
+The dashboard uses database-side statistics, date-filtered and paginated daily
+appointments, bounded patient-name search, and paginated patient history. Apply
+new database changes with `alembic upgrade head`; the current migration also
+adds a composite appointment date/order index.
+
 ## Local GenAI staff assistant
 
 Install Ollama locally, download a supported local model (default: `qwen2.5:3b`),

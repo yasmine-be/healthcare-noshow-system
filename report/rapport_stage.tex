@@ -34,6 +34,7 @@
   pdfauthor={Prénom NOM -- à compléter},
   pdfsubject={Rapport de stage en informatique},
   colorlinks=true,
+  hypertexnames=false,
   linkcolor=navy,
   urlcolor=blue,
   citecolor=teal
@@ -195,8 +196,8 @@ complexe. \code{main.py} crée l'application FastAPI, charge
 \code{models.py} décrit les tables SQLAlchemy, \code{schemas.py} les contrats
 Pydantic et \code{database.py} la configuration de la connexion. Le tableau de
 bord (\code{dashboard.py}) consomme l'API via HTTP. Le script
-\code{train_model.py} et le module \code{feature_engineering.py} portent le
-pipeline de données et de modèle. \code{assistant_agent.py} encapsule la
+\code{train\_model.py} et le module \code{feature\_engineering.py} portent le
+pipeline de données et de modèle. \code{assistant\_agent.py} encapsule la
 requête au service Ollama.
 
 \begin{figure}[htbp]
@@ -207,7 +208,7 @@ requête au service Ollama.
   \node[component,right=of staff] (dash) {Interface Streamlit\\
     \code{dashboard.py}};
   \node[component,right=of dash] (api) {API REST FastAPI\\
-    \code{main.py}};
+    \code{main.py}\\lectures dashboard bornées};
   \node[storage,right=of api] (db) {PostgreSQL\\patients, médecins,\\
     rendez-vous, comptes, audit};
   \node[component,below=1.1cm of api] (model) {Inférence\\
@@ -218,7 +219,7 @@ requête au service Ollama.
     \code{feature\_engineering.py}\\\code{train\_model.py}};
 
   \draw[flow] (staff) -- (dash);
-  \draw[flow] (dash) -- node[flowlabel,above]{HTTP / JSON\\Bearer JWT} (api);
+  \draw[flow] (dash) -- node[flowlabel,above]{HTTP / JSON\\Bearer JWT\\routes dashboard} (api);
   \draw[flow] (api) -- node[flowlabel,above]{SQLAlchemy} (db);
   \draw[flow] (api) -- node[flowlabel,right]{features\\numériques} (model);
   \draw[flow] (api) -- node[flowlabel,right]{requête locale\\numérique} (ollama);
@@ -288,7 +289,7 @@ Le README indique les commandes de démarrage suivantes après installation,
 configuration et application de la migration :
 \begin{itemize}
   \item \code{alembic upgrade head} pour créer les tables absentes ;
-  \item \code{python create_user.py} pour créer un compte initial ;
+  \item \code{python create\_user.py} pour créer un compte initial ;
   \item \code{uvicorn main:app --reload} pour démarrer l'API ;
   \item \code{streamlit run dashboard.py} pour démarrer le tableau de bord.
 \end{itemize}
@@ -304,6 +305,9 @@ Les requêtes sont validées avec les schémas Pydantic. Les routes sauf
 \code{limit}/\code{offset}; les listes patients et médecins ont une limite par
 défaut de 100 et maximale de 500. La liste des rendez-vous accepte aussi
 \code{from\_date} et \code{to\_date}. Une plage inversée est rejetée.
+Des routes spécifiques au tableau de bord fournissent des consultations
+filtrées, des agrégats calculés en base et une recherche patient bornée, afin
+d'éviter de charger systématiquement toutes les lignes dans Streamlit.
 
 \begin{longtable}{>{\raggedright\arraybackslash}p{2.35cm}
                   >{\raggedright\arraybackslash}p{4.3cm}
@@ -332,6 +336,20 @@ POST / GET / GET par ID / PUT & \code{/appointments} et
 \code{/appointments/\{appointment\_id\}} & Création, liste paginée et filtrée
 par date, lecture et mise à jour d'un rendez-vous. Aucune route DELETE n'est
 définie.\\
+GET & \code{/dashboard/appointments} & Requiert \code{appointment\_date} ;
+joint le nom du patient et retourne les rendez-vous de cette date, avec délai,
+jour de semaine et nombre de no-shows aux dates antérieures. Pagination bornée
+à 500 éléments par réponse.\\
+GET & \code{/dashboard/statistics} & Retourne la date la plus récente ainsi
+que des comptes par mois et par motif ; les agrégations sont exécutées par la
+base.\\
+GET & \code{/dashboard/patients} & Recherche facultative par nom
+(\code{query}, 100 caractères au plus), pagination par défaut de 50 et limite
+maximale de 100 ; ne retourne que l'identifiant et le nom.\\
+GET & \code{/dashboard/patients/}\\\code{\{patient\_id\}/history} & Renvoie les
+comptes total/no-show du patient et une page d'historique limitée à 500
+rendez-vous ; accepte \code{limit}/\code{offset} et retourne 404 si le patient
+n'existe pas.\\
 \bottomrule
 \end{longtable}
 
@@ -405,7 +423,8 @@ d'affectation du médecin.\\
 \code{appointments} & \code{id} PK, \code{patient\_id} FK,
 \code{doctor\_id} FK, \code{date\_reservation}, \code{date\_rdv},
 \code{motif\_visite}, \code{statut} & Rendez-vous relié à un patient et un
-médecin. Index sur les deux clés étrangères et la date du rendez-vous.\\
+médecin. Index sur les deux clés étrangères et index composite
+\code{(date\_rdv, id)} adapté au tri par date puis identifiant.\\
 \code{users} & \code{id} PK, \code{username} unique,
 \code{hashed\_password}, \code{role} & Comptes applicatifs ; contrainte SQL
 sur les rôles \code{admin} et \code{staff}.\\
@@ -423,7 +442,12 @@ pour éviter les problèmes d'échappement du mot de passe. Alembic applique une
 migration initiale qui crée les tables manquantes et vérifie les index. Elle
 ne modifie pas les colonnes d'une table déjà présente et est volontairement
 irréversible afin de protéger les données existantes ; les divergences de
-schéma héritées exigent donc une migration explicite.
+schéma héritées exigent donc une migration explicite. Une migration ultérieure
+en avant remplace l'index simple \code{ix\_appointments\_date\_rdv} par
+l'index composite \code{(date\_rdv, id)} lorsque l'index historique existe.
+Elle vérifie les colonnes existantes, préserve les rendez-vous et ne définit
+pas de rétrogradation ; l'application en production doit être planifiée et
+contrôlée comme toute évolution de schéma.
 
 \chapter{Tableau de bord Streamlit}
 \section{Fonctions visibles}
@@ -431,27 +455,39 @@ L'interface fournit un formulaire de connexion, une déconnexion, un filtre
 par date, une liste des rendez-vous de la journée enrichie par des scores,
 trois indicateurs (volume de rendez-vous, nombre de risques élevés, risque
 moyen), ainsi que deux vues statistiques : le taux mensuel de no-show et le
-taux par motif. Un onglet de recherche patient présente le nombre de no-shows
-et l'historique des rendez-vous de ce patient. Une action explicite ouvre
+taux par motif. Les listes et statistiques sont alimentées par les routes
+dédiées \code{/dashboard/appointments} et \code{/dashboard/statistics} :
+les rendez-vous sont filtrés dans la base avant affichage, les variables
+d'inférence sont préparées côté API et les agrégats sont calculés côté base.
+L'onglet de recherche patient appelle \code{/dashboard/patients} et fournit
+une recherche par nom limitée à 100 caractères avec au plus 100 résultats
+par page (50 par défaut). La consultation de l'historique est paginée via
+\code{/dashboard/patients/}\\\code{\{patient\_id\}/history} ; les totaux de rendez-vous
+et de no-shows sont calculés côté base, tandis qu'au plus 500 entrées
+d'historique sont retournées par requête. Une action explicite ouvre
 l'assistant pour un rendez-vous sélectionné.
 
 Les requêtes HTTP utilisent le jeton bearer conservé dans l'état de session.
 Le client a un délai d'attente de dix secondes par défaut et traite une
 réponse 401 en effaçant le jeton. L'appel GenAI utilise un délai de 90 secondes.
-L'interface charge les rendez-vous et les patients par pages de 500, puis
-construit des DataFrames en mémoire. Pour la date sélectionnée, elle envoie
-les variables d'inférence en lots à \code{/predict/batch}.
+Pour la date sélectionnée, le tableau de bord demande des pages d'au plus 500
+rendez-vous déjà filtrés et enrichis par l'API, puis envoie les variables
+d'inférence en lots à \code{/predict/batch}. Les données patient utilisées
+pour l'onglet de recherche et d'historique sont récupérées à la demande et
+bornées par pagination, plutôt que de télécharger tout le répertoire.
 
 \section{Limites d'usage et d'échelle}
 Cette interface est un outil de consultation, pas une application complète
 d'administration : aucun formulaire de saisie ou de suppression n'est codé
 dans Streamlit, et les opérations de création ou de mise à jour sont
-uniquement disponibles comme routes d'API. Malgré la pagination HTTP, le
-tableau de bord finit par récupérer l'ensemble des pages et de l'historique ;
-les statistiques sont calculées côté client. Le filtrage principal des
-rendez-vous par date se fait après téléchargement. Pour un grand volume, il
-faudrait déplacer les agrégations et filtres vers la base et limiter
-l'historique consulté.
+uniquement disponibles comme routes d'API. Les principales lectures du
+tableau de bord sont désormais filtrées/agrégées côté base et l'historique est
+borné par pages ; cela réduit les transferts inutiles sans constituer une
+mesure de performance validée. La recherche d'un patient renvoie au plus une
+page de résultats à la fois, et l'interface actuelle ne propose pas de
+navigation de pages dans les résultats de recherche. Les plans de requête,
+index utiles, temps de réponse et comportement sous charge restent à mesurer
+sur un jeu de test représentatif.
 
 Le tableau de bord manipule en mémoire des identifiants, noms et motifs de
 visite pour afficher ses vues, même si ces valeurs ne sont pas transmises à
@@ -623,11 +659,25 @@ Le fichier \code{tests/test\_project.py} couvre notamment :
   \item la création non destructive des tables manquantes par migration et
         des cas d'API : authentification, prédiction, lots et audit.
 \end{itemize}
+Les tests complémentaires \code{tests/test\_dashboard\_api.py} vérifient les
+routes de lecture du tableau de bord, leurs limites et les réponses
+paginées ; \code{tests/test\_query\_indexes.py} vérifie l'index composite et
+le remplacement de l'index historique par migration en avant sans perte des
+lignes existantes.
 Les tests utilisent une base SQLite en mémoire ou de test, des données
 fabriquées et des appels externes simulés. Le workflow GitHub Actions
 \code{.github/workflows/tests.yml} installe les dépendances, compile les
 modules Python, exécute la suite unittest et vérifie la découverte de
 l'historique Alembic sur les événements push et pull request.
+
+\textbf{Résultat vérifié le 9 novembre 2026 :} la commande ci-dessous a exécuté
+27 tests avec succès dans l'environnement de développement. Il s'agit de tests
+unitaires utilisant notamment SQLite et des services externes simulés ; ce
+résultat ne démontre ni les performances en production, ni l'interopérabilité
+complète avec PostgreSQL, ni une validation clinique :
+
+\textbf{Commande :} \code{python -m unittest discover -s tests -v}\\
+\textbf{Résultat observé :} \code{Ran 27 tests; OK}
 
 \section{Ce que les tests ne prouvent pas}
 Les tests unitaires ne démontrent pas le fonctionnement sur PostgreSQL
@@ -635,13 +685,7 @@ configuré pour un déploiement, la robustesse sous charge, la sécurité d'une
 configuration réseau, la qualité des prédictions sur des données de terrain
 ou la conformité réglementaire. Ils ne remplacent pas des tests d'intégration
 et de bout en bout, des tests d'autorisation par rôle, une analyse de
-dépendances ou des essais utilisateur. L'état des tests à la date de remise
-doit être renseigné à partir d'une exécution reproductible :
-\[
-\text{Commande : } \code{python -m unittest discover -s tests -v}
-\qquad
-\text{Résultat observé : } \placeholder{à renseigner}
-\]
+dépendances ou des essais utilisateur.
 
 \chapter{Feuille de route et recommandations}
 Le fichier \code{IMPROVEMENT\_ROADMAP.md} organise les évolutions en priorités.
@@ -660,11 +704,14 @@ secrets, chiffrement des connexions et sauvegardes ; ajouter limitation des
 tentatives, MFA, gestion des comptes, rétention d'audit et restauration
 testée. & Réduire les risques de lancement et établir les conditions de
 traitement légitime et sécurisé avant toute donnée réelle.\\
-P1 & \planned{} Déplacer filtres et agrégations vers la base, borner
-l'historique, vérifier les plans de requête et index, ajouter santé et
-disponibilité, erreurs structurées, suivi, traçage, CI élargie et
-environnements reproductibles. & Améliorer la fiabilité, la performance et
-l'exploitabilité du service.\\
+P1 & \implemented{} Les lectures dédiées du tableau de bord filtrent les
+rendez-vous, calculent les statistiques et bornent recherche/historique côté
+API et base ; une migration en avant ajoute l'index
+\code{(date\_rdv, id)}. \planned{} Mesurer les plans de requête, index et
+temps de réponse sur un jeu représentatif, puis ajouter santé et disponibilité,
+erreurs structurées, suivi, traçage, CI élargie et environnements
+reproductibles. & Confirmer les gains réels et améliorer la fiabilité,
+la performance et l'exploitabilité du service.\\
 P2 & \planned{} Versionner les jeux, variables, modèles et évaluations ;
 documenter les étiquettes ; évaluer chronologiquement et par groupes,
 calibration, impact opérationnel et dérive ; prévoir une revue humaine et

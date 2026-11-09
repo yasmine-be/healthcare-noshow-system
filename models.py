@@ -35,7 +35,7 @@ class Appointment(Base):
     __table_args__ = (
         Index("ix_appointments_patient_id", "patient_id"),
         Index("ix_appointments_doctor_id", "doctor_id"),
-        Index("ix_appointments_date_rdv", "date_rdv"),
+        Index("ix_appointments_date_rdv", "date_rdv", "id"),
     )
 
     id = Column(Integer, primary_key=True, index=True)

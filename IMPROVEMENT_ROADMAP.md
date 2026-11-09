@@ -17,11 +17,14 @@ Prioritize these steps before treating the project as a production service.
 
 ## P1 — Reliability and performance
 
-- Move from loading every appointment into Streamlit to database-side
-  aggregation, date-filtered queries, and bounded paginated patient history.
-- Add indexes for common filters and joins (`appointments.date_rdv`,
-  `appointments.patient_id`, `appointments.doctor_id`) after checking actual
-  query plans and table size.
+- **Implemented:** move dashboard date filtering, statistics aggregation,
+  bounded patient lookup, and patient history pagination into database-side
+  API queries; batch predictions rather than issuing one request per row.
+- **Implemented:** add the `(date_rdv, id)` composite index used by the
+  appointment date/order query.
+- Measure query plans against production-like synthetic data before adding more
+  indexes; avoid index additions that increase write and storage costs without
+  measured benefit.
 - Add connection-pool sizing, health/readiness endpoints, structured error
   handling, monitoring, and request tracing.
 - Add CI for formatting, static checks, migrations, tests, and dependency

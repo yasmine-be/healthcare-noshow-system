@@ -5,7 +5,8 @@ import joblib
 import pandas as pd
 from fastapi import APIRouter, Depends, FastAPI, HTTPException, Query
 from fastapi.security import OAuth2PasswordRequestForm
-from sqlalchemy.orm import Session
+from sqlalchemy import case, extract, func
+from sqlalchemy.orm import Session, aliased
 
 import models
 import schemas
@@ -217,6 +218,161 @@ def list_appointments(
         .limit(limit)
         .all()
     )
+
+
+@protected.get("/dashboard/appointments")
+def dashboard_appointments(
+    appointment_date: date,
+    db: Session = Depends(get_db),
+    limit: int = Query(default=500, ge=1, le=500),
+    offset: int = Query(default=0, ge=0),
+):
+    appointment = models.Appointment
+    previous_appointment = aliased(models.Appointment)
+    prior_no_shows = (
+        db.query(func.count(previous_appointment.id))
+        .filter(
+            previous_appointment.patient_id == appointment.patient_id,
+            previous_appointment.date_rdv < appointment_date,
+            previous_appointment.statut == "no_show",
+        )
+        .correlate(appointment)
+        .scalar_subquery()
+    )
+    rows = (
+        db.query(
+            models.Appointment,
+            models.Patient.name.label("patient_name"),
+            prior_no_shows.label("nb_no_show_precedents"),
+        )
+        .join(models.Patient, models.Patient.id == models.Appointment.patient_id)
+        .filter(models.Appointment.date_rdv == appointment_date)
+        .order_by(models.Appointment.date_rdv, models.Appointment.id)
+        .offset(offset)
+        .limit(limit)
+        .all()
+    )
+    return [
+        {
+            "id": row.id,
+            "patient_id": row.patient_id,
+            "patient_name": patient_name,
+            "doctor_id": row.doctor_id,
+            "date_reservation": row.date_reservation,
+            "date_rdv": row.date_rdv,
+            "motif_visite": row.motif_visite,
+            "statut": row.statut,
+            "delai_jours": (row.date_rdv - row.date_reservation).days,
+            "jour_semaine": row.date_rdv.weekday(),
+            "nb_no_show_precedents": previous_no_shows or 0,
+        }
+        for row, patient_name, previous_no_shows in rows
+    ]
+
+
+@protected.get("/dashboard/patients")
+def search_dashboard_patients(
+    db: Session = Depends(get_db),
+    query: str | None = Query(default=None, max_length=100),
+    limit: int = Query(default=50, ge=1, le=100),
+    offset: int = Query(default=0, ge=0),
+):
+    patients = db.query(models.Patient.id, models.Patient.name)
+    if query:
+        patients = patients.filter(models.Patient.name.ilike(f"%{query}%"))
+    return [
+        {"id": patient_id, "name": name}
+        for patient_id, name in patients.order_by(models.Patient.name, models.Patient.id)
+        .offset(offset)
+        .limit(limit)
+        .all()
+    ]
+
+
+@protected.get("/dashboard/statistics")
+def dashboard_statistics(db: Session = Depends(get_db)):
+    appointment = models.Appointment
+    no_show_count = func.sum(case((appointment.statut == "no_show", 1), else_=0))
+    monthly_rows = (
+        db.query(
+            extract("year", appointment.date_rdv).label("year"),
+            extract("month", appointment.date_rdv).label("month"),
+            func.count(appointment.id).label("total"),
+            no_show_count.label("no_show"),
+        )
+        .group_by(extract("year", appointment.date_rdv), extract("month", appointment.date_rdv))
+        .order_by(extract("year", appointment.date_rdv), extract("month", appointment.date_rdv))
+        .all()
+    )
+    motif_rows = (
+        db.query(
+            appointment.motif_visite,
+            func.count(appointment.id).label("total"),
+            no_show_count.label("no_show"),
+        )
+        .group_by(appointment.motif_visite)
+        .order_by(appointment.motif_visite)
+        .all()
+    )
+    return {
+        "latest_date": db.query(func.max(appointment.date_rdv)).scalar(),
+        "monthly": [
+            {
+                "month": f"{int(year):04d}-{int(month):02d}",
+                "total": total,
+                "no_show": no_show or 0,
+            }
+            for year, month, total, no_show in monthly_rows
+        ],
+        "motifs": [
+            {
+                "motif_visite": motif,
+                "total": total,
+                "no_show": no_show or 0,
+            }
+            for motif, total, no_show in motif_rows
+        ],
+    }
+
+
+@protected.get("/dashboard/patients/{patient_id}/history")
+def dashboard_patient_history(
+    patient_id: int,
+    db: Session = Depends(get_db),
+    limit: int = Query(default=500, ge=1, le=500),
+    offset: int = Query(default=0, ge=0),
+):
+    if patient_id < 1:
+        raise HTTPException(status_code=422, detail="patient_id must be positive")
+    patient_appointments = db.query(models.Appointment).filter(
+        models.Appointment.patient_id == patient_id
+    )
+    if db.query(models.Patient.id).filter(models.Patient.id == patient_id).first() is None:
+        raise HTTPException(status_code=404, detail="Patient not found")
+    total, no_show_count = (
+        db.query(
+            func.count(models.Appointment.id),
+            func.coalesce(
+                func.sum(case((models.Appointment.statut == "no_show", 1), else_=0)),
+                0,
+            ),
+        )
+        .filter(models.Appointment.patient_id == patient_id)
+        .one()
+    )
+    rows = (
+        patient_appointments.order_by(
+            models.Appointment.date_rdv, models.Appointment.id
+        )
+        .offset(offset)
+        .limit(limit)
+        .all()
+    )
+    return {
+        "total": total,
+        "no_show_count": no_show_count,
+        "items": rows,
+    }
 
 
 @protected.get("/appointments/{appointment_id}", response_model=schemas.AppointmentOut)

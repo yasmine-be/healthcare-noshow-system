@@ -6,7 +6,6 @@ import plotly.express as px
 import requests
 import streamlit as st
 
-from feature_engineering import build_features
 from risk import HIGH_RISK_LOWER_BOUND
 
 API_URL = os.getenv("API_URL", "http://127.0.0.1:8000").rstrip("/")
@@ -72,15 +71,14 @@ def api_request(method, path, *, authenticated=True, **kwargs):
     return response.json()
 
 
-def fetch_all(path):
+def fetch_all(path, *, params=None):
     records = []
     offset = 0
     while True:
-        page = api_request(
-            "GET",
-            path,
-            params={"limit": PAGE_SIZE, "offset": offset},
-        )
+        page_params = {"limit": PAGE_SIZE, "offset": offset}
+        if params:
+            page_params.update(params)
+        page = api_request("GET", path, params=page_params)
         records.extend(page)
         if len(page) < PAGE_SIZE:
             return records
@@ -121,55 +119,31 @@ with st.sidebar:
         st.session_state.token = None
         st.rerun()
 
-appointments = fetch_all("/appointments")
-patients = fetch_all("/patients")
-df = pd.DataFrame(
-    appointments,
-    columns=[
-        "id",
-        "patient_id",
-        "doctor_id",
-        "date_reservation",
-        "date_rdv",
-        "motif_visite",
-        "statut",
-    ],
+statistics = api_request("GET", "/dashboard/statistics")
+default_date = (
+    date.fromisoformat(statistics["latest_date"])
+    if statistics["latest_date"]
+    else date.today()
 )
-df_patients = pd.DataFrame(patients, columns=["id", "name"])
-if not df.empty:
-    df["date_reservation"] = pd.to_datetime(df["date_reservation"])
-    df["date_rdv"] = pd.to_datetime(df["date_rdv"])
-    features = build_features(df)
-    df = df.merge(
-        df_patients[["id", "name"]],
-        left_on="patient_id",
-        right_on="id",
-        how="left",
-        suffixes=("", "_patient"),
-    ).rename(columns={"name": "patient_name"})
-    df["patient_name"] = df["patient_name"].fillna("Patient inconnu")
-    default_date = df["date_rdv"].max().date()
-else:
-    features = pd.DataFrame(columns=["id", "date_rdv", "patient_id", "delai_jours",
-                                     "jour_semaine", "nb_no_show_precedents"])
-    default_date = date.today()
 
 selected_date = st.sidebar.date_input("Date à analyser", value=default_date)
-day_appointments = (
-    df[df["date_rdv"].dt.date == selected_date].copy() if not df.empty else df.copy()
+day_appointments = pd.DataFrame(
+    fetch_all(
+        "/dashboard/appointments",
+        params={"appointment_date": selected_date.isoformat()},
+    )
 )
 
 if day_appointments.empty:
     st.info(f"Aucun rendez-vous le {selected_date}.")
 else:
-    day_features = features[features["date_rdv"].dt.date == selected_date]
     batch = [
         {
             "delai_jours": int(row.delai_jours),
             "jour_semaine": int(row.jour_semaine),
             "nb_no_show_precedents": int(row.nb_no_show_precedents),
         }
-        for row in day_features.itertuples()
+        for row in day_appointments.itertuples()
     ]
     predictions = []
     for start in range(0, len(batch), PAGE_SIZE):
@@ -181,18 +155,6 @@ else:
             )
         )
     prediction_frame = pd.DataFrame(predictions)
-    day_appointments = day_appointments.merge(
-        features[
-            [
-                "id",
-                "delai_jours",
-                "jour_semaine",
-                "nb_no_show_precedents",
-            ]
-        ].assign(_feature_order=range(len(features))),
-        on="id",
-        how="left",
-    ).sort_values("_feature_order")
     day_appointments["risk_score"] = prediction_frame["risk_score"].to_numpy()
     day_appointments["risk_level"] = prediction_frame["risk_level"].to_numpy()
     day_appointments = day_appointments.sort_values("risk_score", ascending=False)
@@ -245,27 +207,24 @@ else:
         st.markdown("\n".join(f"- {action}" for action in advice["actions"]))
         st.caption(advice["disclaimer"])
 
-if not df.empty:
+if statistics["latest_date"]:
     tab_stats, tab_patient = st.tabs(["Statistiques globales", "Recherche patient"])
     with tab_stats:
-        monthly_stats = (
-            df.assign(mois=df["date_rdv"].dt.to_period("M").astype(str))
-            .groupby("mois")["statut"]
-            .apply(lambda status: status.eq("no_show").mean() * 100)
-            .rename("Taux de no-show (%)")
-            .reset_index()
-        )
+        monthly_stats = pd.DataFrame(statistics["monthly"])
+        if not monthly_stats.empty:
+            monthly_stats["Taux de no-show (%)"] = (
+                monthly_stats["no_show"] / monthly_stats["total"] * 100
+            )
         st.subheader("Taux de no-show par mois")
         st.plotly_chart(
-            px.bar(monthly_stats, x="mois", y="Taux de no-show (%)"),
+            px.bar(monthly_stats, x="month", y="Taux de no-show (%)"),
             use_container_width=True,
         )
-        motif_stats = (
-            df.groupby("motif_visite")["statut"]
-            .apply(lambda status: status.eq("no_show").mean() * 100)
-            .rename("Taux de no-show (%)")
-            .reset_index()
-        )
+        motif_stats = pd.DataFrame(statistics["motifs"])
+        if not motif_stats.empty:
+            motif_stats["Taux de no-show (%)"] = (
+                motif_stats["no_show"] / motif_stats["total"] * 100
+            )
         st.subheader("Taux de no-show par motif")
         st.plotly_chart(
             px.bar(motif_stats, x="motif_visite", y="Taux de no-show (%)"),
@@ -273,12 +232,21 @@ if not df.empty:
         )
 
     with tab_patient:
+        patient_query = st.text_input("Rechercher par nom", max_chars=100)
+        patient_results = api_request(
+            "GET",
+            "/dashboard/patients",
+            params={"query": patient_query, "limit": 50},
+        )
         patient_options = sorted(
-            ((int(row.id), str(row.name)) for row in df_patients.itertuples()),
+            (
+                (int(patient["id"]), str(patient["name"]))
+                for patient in patient_results
+            ),
             key=lambda item: (item[1].casefold(), item[0]),
         )
         if not patient_options:
-            st.info("Aucun patient enregistré.")
+            st.info("Aucun patient correspondant. Essayez une autre recherche.")
         else:
             selected_id = st.selectbox(
                 "Choisir un patient",
@@ -287,11 +255,32 @@ if not df.empty:
                     name for current_id, name in patient_options if current_id == patient_id
                 ),
             )
-            patient_history = df[df["patient_id"] == selected_id].sort_values("date_rdv")
-            no_shows = patient_history["statut"].eq("no_show").sum()
-            st.metric("Historique de no-show", f"{no_shows} / {len(patient_history)}")
+            history_page = st.number_input(
+                "Page d’historique", min_value=1, value=1, step=1
+            )
+            patient_history = api_request(
+                "GET",
+                f"/dashboard/patients/{selected_id}/history",
+                params={
+                    "limit": PAGE_SIZE,
+                    "offset": (int(history_page) - 1) * PAGE_SIZE,
+                },
+            )
+            st.metric(
+                "Historique de no-show",
+                f"{patient_history['no_show_count']} / {patient_history['total']}",
+            )
+            st.caption(
+                f"Affichage de la page {int(history_page)} "
+                f"({len(patient_history['items'])} rendez-vous maximum par page)."
+            )
             st.dataframe(
-                patient_history[["date_rdv", "motif_visite", "statut"]],
+                pd.DataFrame(
+                    patient_history["items"],
+                    columns=["date_rdv", "motif_visite", "statut"],
+                )[
+                    ["date_rdv", "motif_visite", "statut"]
+                ],
                 use_container_width=True,
                 hide_index=True,
             )
